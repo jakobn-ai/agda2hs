@@ -1,0 +1,2 @@
+test/Fail/RuntimeCheckUnboxed.agda:9,8-19
+Cannot make record NoUnboxable unboxed. Unboxed records cannot have erased arguments in their fields with runtime checking.

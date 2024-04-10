@@ -4,10 +4,12 @@ module Agda2Hs.Compile.Record where
 import Control.Monad ( unless, when )
 import Control.Monad.Reader ( MonadReader(local) )
 
-import Data.List ( (\\), nub )
+import Data.Functor ( (<&>) )
+import Data.List ( (\\), intercalate, nub )
 import Data.List.NonEmpty ( NonEmpty(..) )
 import Data.Map ( Map )
 import qualified Data.Map as Map
+import Data.Maybe ( maybeToList )
 
 import qualified Language.Haskell.Exts as Hs
 
@@ -23,10 +25,12 @@ import Agda.TypeChecking.Telescope
 
 import Agda.Utils.Singleton
 import Agda.Utils.Impossible ( __IMPOSSIBLE__ )
+import Agda.Utils.Monad ( andM, ifM, whenM )
 
 import Agda2Hs.AgdaUtils
 import Agda2Hs.Compile.ClassInstance
 import Agda2Hs.Compile.Function ( compileFun )
+import Agda2Hs.Compile.RuntimeCheckUtils
 import Agda2Hs.Compile.Type ( compileDomType, compileTeleBinds, compileDom, DomOutput(..) )
 import Agda2Hs.Compile.Types
 import Agda2Hs.Compile.Utils
@@ -50,7 +54,7 @@ compileMinRecord fieldNames m = do
   -- * it has an explicit dictionary argument
   -- * it's using the fields and definitions from the minimal record and not the parent record
   compiled <- withMinRecord m $ addContext (defaultDom rtype) $ compileLocal $
-    fmap concat $ traverse (compileFun False) defaults
+    concatMap defn <$> traverse (compileFun False) defaults
   let declMap = Map.fromList [ (definedName c, def) | def@(Hs.FunBind _ (c : _)) <- compiled ]
   return (definedFields, declMap)
 
@@ -91,7 +95,7 @@ compileMinRecords def sls = do
   return ([minPragma | not (null prims)] ++ Map.elems decls)
 
 
-compileRecord :: RecordTarget -> Definition -> C (Hs.Decl ())
+compileRecord :: RecordTarget -> Definition -> C RtcDecls
 compileRecord target def = do
   TelV tel _ <- telViewUpTo recPars (defType def)
   addContext tel $ do
@@ -101,24 +105,41 @@ compileRecord target def = do
     let fieldTel = snd $ splitTelescopeAt recPars recTel
     case target of
       ToClass ms -> do
-        (classConstraints, classDecls) <- compileRecFields classDecl recFields fieldTel
+        whenM (andM [emitsRtc $ defName def, not <$> checkNoneErased fieldTel]) $ genericDocError =<<
+             "Cannot compile" <+> prettyTCM (defName def) <+> "to class." <+>
+             "Classes cannot have erased arguments with runtime checking."
+        (classConstraints, classDecls, _) <- compileRecFields classDecl recFields fieldTel
         let context = case classConstraints of
               []     -> Nothing
               [asst] -> Just (Hs.CxSingle () asst)
               assts  -> Just (Hs.CxTuple () assts)
         defaultDecls <- compileMinRecords def ms
-        return $ Hs.ClassDecl () context hd [] (Just (classDecls ++ map (Hs.ClsDecl ()) defaultDecls))
+        return $ WithRtc [Hs.ClassDecl () context hd [] (Just (classDecls ++ map (Hs.ClsDecl ()) defaultDecls))] []
       ToRecord newtyp ds -> do
+        smartQName <- smartConstructor (defName def) False
+
         checkValidConName cName
-        (constraints, fieldDecls) <- compileRecFields fieldDecl recFields fieldTel
+        (constraints, fieldDecls, fieldStrings) <- compileRecFields fieldDecl recFields fieldTel
+
+        chk <- ifM (emitsRtc $ defName def) (do
+          (noneErasedCons, chk) <- checkRtc fieldTel smartQName (hsVar conString) >>= \case
+            NoneErased -> return ([conString], [])
+            Uncheckable -> return ([], [])
+            Checkable ds -> return ([], ds)
+          -- Always export record name and field names. Export constructor when it has no erased types.
+          tellNoErased $ rString ++ "(" ++ intercalate ", " (fieldStrings ++ noneErasedCons) ++ ")"
+          return chk)
+          $ return []
+
         when newtyp $ checkNewtypeCon cName fieldDecls
         let target = if newtyp then Hs.NewType () else Hs.DataType ()
-        compileDataRecord constraints fieldDecls target hd ds
-
+        (\c -> WithRtc [c] chk) <$> compileDataRecord constraints fieldDecls target hd ds
   where
-    rName = hsName $ prettyShow $ qnameName $ defName def
-    cName | recNamedCon = hsName $ prettyShow $ qnameName $ conName recConHead
-          | otherwise   = rName   -- Reuse record name for constructor if no given name
+    rString = prettyShow $ qnameName $ defName def
+    rName = hsName rString
+    conString | recNamedCon = prettyShow $ qnameName $ conName recConHead
+              | otherwise   = rString   -- Reuse record name for constructor if no given name
+    cName = hsName conString
 
     -- In Haskell, projections live in the same scope as the record type, so check here that the
     -- record module has been opened.
@@ -138,23 +159,24 @@ compileRecord target def = do
     fieldDecl n = Hs.FieldDecl () [n]
 
     compileRecFields :: (Hs.Name () -> Hs.Type () -> b)
-                     -> [Dom QName] -> Telescope -> C ([Hs.Asst ()], [b])
+                     -> [Dom QName] -> Telescope -> C ([Hs.Asst ()], [b], [String])
     compileRecFields decl ns tel = case (ns, tel) of
-      (_   , EmptyTel          ) -> return ([], [])
+      (_   , EmptyTel          ) -> return ([], [], [])
       (n:ns, ExtendTel dom tel') -> do
         hsDom <- compileDomType (absName tel') dom
-        (hsAssts, hsFields) <- underAbstraction dom tel' $ compileRecFields decl ns
+        (hsAssts, hsFields, fieldStrings) <- underAbstraction dom tel' $ compileRecFields decl ns
         case hsDom of
           DomType s hsA -> do
-            let fieldName = hsName $ prettyShow $ qnameName $ unDom n
+            let fieldString = prettyShow $ qnameName $ unDom n
+                fieldName = hsName fieldString
             fieldType <- addTyBang s hsA
             checkValidFunName fieldName
-            return (hsAssts, decl fieldName fieldType : hsFields)
+            return (hsAssts, decl fieldName fieldType : hsFields, fieldString : fieldStrings)
           DomConstraint hsA -> case target of
-            ToClass{} -> return (hsA : hsAssts , hsFields)
+            ToClass{} -> return (hsA : hsAssts, hsFields, fieldStrings)
             ToRecord{} -> genericError $
               "Not supported: record/class with constraint fields"
-          DomDropped -> return (hsAssts , hsFields)
+          DomDropped -> return (hsAssts, hsFields, fieldStrings)
           DomForall{} -> __IMPOSSIBLE__
       (_, _) -> __IMPOSSIBLE__
 
@@ -185,6 +207,9 @@ checkUnboxPragma def = do
   addContext tel $ do
     pars <- getContextArgs
     let fieldTel = recTel `apply` pars
+    whenM (andM [emitsRtc $ defName def, not <$> checkNoneErased fieldTel]) $ genericDocError =<<
+          "Cannot make record" <+> prettyTCM (defName def) <+> "unboxed." <+>
+          "Unboxed records cannot have erased arguments in their fields with runtime checking."
     fields <- nonErasedFields fieldTel
     unless (length fields == 1) $ genericDocError
       =<< "Unboxed record" <+> prettyTCM (defName def)
