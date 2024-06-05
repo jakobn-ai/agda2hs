@@ -34,6 +34,7 @@ import Agda.TypeChecking.Records ( isRecordConstructor )
 
 import qualified Agda.Utils.List1 as List1
 import Agda.Utils.Maybe ( isJust, isNothing, whenJust, fromMaybe, caseMaybeM )
+import Agda.Utils.Monad ( ifM )
 
 import Agda2Hs.AgdaUtils
 import Agda2Hs.Compile.Types
@@ -102,9 +103,13 @@ compileQName f
     parent <- parentName f
     par <- traverse (compileName . qnameName) parent
     let mod0 = qnameModule $ fromMaybe f parent
-    mod <- compileModuleName mod0
+    mod' <- compileModuleName mod0
+    mod <- ifM (emitsRtc f) (case mod' of
+      Hs.ModuleName () s -> do
+        return $ Hs.ModuleName () $ s ++ ".PostRtc")
+      $ return mod'
     currMod <- hsTopLevelModuleName <$> asks currModule
-    let skipModule = mod == currMod
+    let skipModule = mod' == currMod
                   || isJust mimpBuiltin
                   || prettyShow mod0 `elem` primMonadModules
     qual <- if | skipModule -> return Unqualified
