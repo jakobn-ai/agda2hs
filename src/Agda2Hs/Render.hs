@@ -1,15 +1,17 @@
+{-# LANGUAGE OverloadedStrings #-}
+
 module Agda2Hs.Render where
 
-import Control.Monad ( unless )
+import Control.Monad ( when, unless )
 import Control.Monad.IO.Class ( MonadIO(liftIO) )
 
 import Data.Function ( on )
-import Data.List ( sortBy, nub )
+import Data.List ( intercalate, sortBy, nub )
 import Data.Maybe ( fromMaybe, isNothing )
 import Data.Set ( Set )
 import qualified Data.Set as Set
 
-import System.FilePath ( takeDirectory, (</>) )
+import System.FilePath ( takeDirectory, takeBaseName, joinPath, (</>) )
 import System.Directory ( createDirectoryIfMissing )
 
 import qualified Language.Haskell.Exts.SrcLoc as Hs
@@ -28,6 +30,7 @@ import Agda.Syntax.TopLevelModuleName
 import Agda.Syntax.Common.Pretty ( prettyShow )
 
 import Agda.Utils.Impossible ( __IMPOSSIBLE__ )
+import qualified Agda.Utils.List1 as List1
 
 import Agda2Hs.Compile
 import Agda2Hs.Compile.Types
@@ -128,21 +131,25 @@ prettyShowImportDecl (Hs.ImportDecl _ m qual src safe mbPkg mbName mbSpecs) =
           (Hs.Ident  _ _)                     -> rest
 
 writeModule :: Options -> ModuleEnv -> IsMain -> TopLevelModuleName
-            -> [(CompiledDef, CompileOutput)] -> TCM ModuleRes
+            -> [(RtcDefs, CompileOutput)] -> TCM ModuleRes
 writeModule opts _ isMain m outs = do
   code <- getForeignPragmas (optExtensions opts)
-  let mod  = prettyShow m
-      (cdefs, impss, extss) = unzip3 $ flip map outs $
-        \(cdef, CompileOutput imps exts) -> (cdef, imps, exts)
-      defs = concatMap defBlock cdefs ++ codeBlocks code
-      imps = concat impss
-      exts = concat extss
+  let mod = prettyShow m
+      defs = concatMap (defBlock . defn . fst) outs ++ codeBlocks code
+      chkdefs = concatMap (defBlock . rtcDefn . fst) outs
+      output = map snd outs
+      imps = concatMap imports output
+      exts = concatMap haskellExtensions output
+      safe = concatMap noErased output
+      chkd = map prettyShow $ concatMap allCheckable output
   unless (null code && null defs && isMain == NotMain) $ do
 
     let unlines' [] = []
         unlines' ss = unlines ss ++ "\n"
 
     let preOpts@PreludeOpts{..} = optPrelude opts
+        nameParts = List1.toList $ rawModuleNameParts $ rawTopLevelModuleName m
+        rtc = optRtc opts && head nameParts `notElem` ["Agda", "Haskell"]
 
     -- if the prelude is supposed to be implicit,
     -- or the prelude imports have been fixed in the config file,
@@ -163,15 +170,29 @@ writeModule opts _ isMain m outs = do
 
     -- The comments make it hard to generate and pretty print a full module
     hsFile <- moduleFileName opts m
+    when (rtc && "PostRtc" `elem` nameParts) $ do
+      genericDocError =<< ("Illegal module name" <+> prettyTCM m)
+        <> ", conflicts with name generated for runtime checks."
+    let postFile = joinPath [takeDirectory hsFile, takeBaseName hsFile, "PostRtc.hs"]
+        renderedExps = intercalate ", " $ safe ++ chkd
 
-    let output = concat
+    -- "pre" runtime check output (_the_ output if RTC disabled)
+    let preOutput = concat
+          [ "module " ++ mod ++ " (" ++ renderedExps ++ ") where\n\n"
+          , autoImports
+          , "import " ++ mod ++ ".PostRtc\n\n"
+          , renderBlocks chkdefs
+          ]
+        output = concat
           [ renderLangExts exts
           , renderBlocks $ codePragmas code
-          , "module " ++ mod ++ " where\n\n"
+          , "module " ++ mod ++ (if rtc then ".PostRtc" else "") ++ " where\n\n"
           , autoImports
           , renderBlocks defs
           ]
 
     reportSLn "" 1 $ "Writing " ++ hsFile
-
-    liftIO $ ensureDirectory hsFile >> writeFile hsFile output
+    liftIO $ ensureDirectory hsFile >> writeFile hsFile (if rtc then preOutput else output)
+    when rtc $ do
+      reportSLn "" 1 $ "Writing " ++ postFile
+      liftIO $ ensureDirectory postFile >> writeFile postFile output
